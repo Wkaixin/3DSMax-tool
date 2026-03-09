@@ -1,0 +1,300 @@
+--------------------------------------------------------------------------------
+-- Mesh + Collision Exporter
+-- Description: Exports visual meshes (and their associated collision(s), if any)
+-- as separate FBX files to a user-specified folder.
+-- Naming: FBX file is named after the visual mesh (not the collision).
+-- Behavior: If objects are selected, only selected visual meshes are exported;
+--           otherwise all visual meshes in the scene are exported.
+-- Collision objects are identified by common prefixes/suffixes and can have
+-- an optional numeric suffix (e.g., UCX_Box_01). All collisions sharing the
+-- same base mesh name are grouped together and exported with that mesh.
+-- Export Settings: The first export will pop up the FBX export options dialog
+--                  to allow global settings; subsequent exports reuse the same settings.
+-- After export, a summary dialog lists all exported meshes and their collision status.
+-- Recent Folder: Automatically opens the last used export folder when selecting output path.
+-- Author: Assistant
+--------------------------------------------------------------------------------
+
+-- Collision naming conventions (modify as needed)
+collisionPrefixes = #("UCX_", "UBX_", "UCP_", "COL_", "COLLISION_", "PCX_", "PCO_")
+collisionSuffixes = #("_COL", "_COLLISION", "_UCX", "_UBX", "_UCP", "_PCX", "_PCO")
+
+-- Global list to store export results for the summary dialog
+global exportResults = #()
+
+-- Settings file path for storing last used folder
+global settingsFile = (getDir #plugcfg) + "\\MeshCollisionExporter.ini"
+
+--------------------------------------------------------------------------------
+-- Helper function to check if a name matches any collision pattern
+fn isCollisionObject objName =
+(
+    for p in collisionPrefixes do
+        if matchPattern objName pattern:(p + "*") then return true
+    for s in collisionSuffixes do
+        if matchPattern objName pattern:("*" + s) then return true
+    false
+)
+
+--------------------------------------------------------------------------------
+-- Strip any known prefix from a name. Returns stripped string or undefined.
+fn stripPrefix objName =
+(
+    for p in collisionPrefixes do
+    (
+        if matchPattern objName pattern:(p + "*") then
+            return (substring objName (p.count+1) -1)
+    )
+    undefined  -- no prefix found
+)
+
+--------------------------------------------------------------------------------
+-- Check if a string consists only of digits
+fn isNumeric str =
+(
+    if str == "" then return false
+    for i = 1 to str.count do
+        if str[i] < "0" or str[i] > "9" then return false
+    true
+)
+
+--------------------------------------------------------------------------------
+-- Find the base mesh name that this collision object belongs to.
+-- Returns mesh name (string) or undefined if no match.
+fn findMatchingMeshName collisionObj meshNames =
+(
+    local colName = collisionObj.name
+    -- First try to strip a known prefix (if any)
+    local stripped = stripPrefix colName
+    if stripped == undefined then return undefined  -- not a prefixed collision
+
+    -- Direct match?
+    if (findItem meshNames stripped) != 0 then return stripped
+
+    -- Try to match with a mesh name + "_" + digits
+    for meshName in meshNames do
+    (
+        local prefixLen = meshName.count + 1  -- meshName + "_"
+        if stripped.count > prefixLen and (substring stripped 1 meshName.count) == meshName then
+        (
+            if stripped[meshName.count+1] == "_" then
+            (
+                local suffix = substring stripped (meshName.count+2) -1
+                if isNumeric suffix then
+                    return meshName
+            )
+        )
+    )
+    undefined  -- no match
+)
+
+--------------------------------------------------------------------------------
+-- Function to build a safe filename (replace spaces, etc.)
+fn safeFileName name =
+(
+    -- Replace spaces and other problematic characters with underscores
+    local safe = name
+    safe = substituteString safe " " "_"
+    safe = substituteString safe "/" "_"
+    safe = substituteString safe "\\" "_"
+    safe = substituteString safe ":" "_"
+    safe = substituteString safe "*" "_"
+    safe = substituteString safe "?" "_"
+    safe = substituteString safe "\"" "_"
+    safe = substituteString safe "<" "_"
+    safe = substituteString safe ">" "_"
+    safe = substituteString safe "|" "_"
+    safe
+)
+
+--------------------------------------------------------------------------------
+-- Main export function
+fn exportMeshesWithCollisions outputDir =
+(
+    -- Clear previous results
+    exportResults = #()
+    
+    -- Collect all geometry objects in the scene
+    allGeom = for obj in geometry where superClassOf obj == GeometryClass collect obj
+    
+    -- Separate into visual meshes and collision objects
+    visualMeshes = #()
+    collisionObjects = #()
+    for obj in allGeom do
+    (
+        if isCollisionObject obj.name then
+            append collisionObjects obj
+        else
+            append visualMeshes obj
+    )
+    
+    -- Determine which visual meshes to export based on selection
+    local meshesToExport = #()
+    if selection.count > 0 then
+    (
+        -- Export only selected visual meshes
+        for obj in selection do
+        (
+            if findItem visualMeshes obj != 0 then
+                append meshesToExport obj
+        )
+    )
+    else
+    (
+        -- Export all visual meshes
+        meshesToExport = visualMeshes
+    )
+    
+    -- If no meshes to export, warn and exit
+    if meshesToExport.count == 0 do
+    (
+        messageBox "No visual meshes selected or found in the scene." title:"Export Error"
+        return false
+    )
+    
+    -- Collect names of all visual meshes for matching
+    local meshNames = for m in visualMeshes collect m.name
+    
+    -- Build a dictionary mapping mesh names to lists of collision objects
+    local collisionDict = #()  -- each element: #(meshName, collisionArray)
+    for col in collisionObjects do
+    (
+        local meshName = findMatchingMeshName col meshNames
+        if meshName != undefined then
+        (
+            -- Find existing entry
+            local entry = undefined
+            for i = 1 to collisionDict.count do
+                if collisionDict[i][1] == meshName then
+                (
+                    entry = collisionDict[i]
+                    exit
+                )
+            if entry == undefined then
+            (
+                -- Create new entry
+                entry = #(meshName, #(col))
+                append collisionDict entry
+            )
+            else
+            (
+                -- Add to existing list
+                append entry[2] col
+            )
+        )
+        else
+        (
+            -- Optional: print warning for unmatched collision
+            format "Warning: Collision object '%' could not be matched to any mesh.\n" col.name
+        )
+    )
+    
+    -- Store current selection to restore later
+    oldSelection = getCurrentSelection()
+    
+    -- Flag for the first export (to show FBX settings dialog)
+    firstExport = true
+    exportCancelled = false
+    
+    -- For each visual mesh in export list, find matching collisions and export
+    for mesh in meshesToExport while not exportCancelled do
+    (
+        -- Find collisions for this mesh (if any)
+        local collisionList = #()
+        for entry in collisionDict where entry[1] == mesh.name do
+        (
+            collisionList = entry[2]
+            exit
+        )
+        
+        -- Build output filename based on mesh name
+        fileName = safeFileName mesh.name + ".fbx"
+        fullPath = outputDir + "\\" + fileName
+        
+        -- Select the mesh and all its collisions
+        select mesh
+        if collisionList.count > 0 then selectmore collisionList
+        
+        -- Export selected objects with FBX settings
+        -- For first export, show the FBX options dialog; subsequent exports use same settings silently
+        if firstExport then
+        (
+            -- Show dialog and export (no #noPrompt)
+            try
+            (
+                exportFile fullPath selectedOnly:true using:FBXEXP
+                firstExport = false
+            )
+            catch
+            (
+                -- If user cancels or an error occurs, stop the whole process
+                exportCancelled = true
+                format "Export cancelled by user or error occurred.\n"
+            )
+        )
+        else
+        (
+            -- Silent export with previously set options
+            exportFile fullPath #noPrompt selectedOnly:true using:FBXEXP
+        )
+        
+        -- Record result for summary (only if export wasn't cancelled)
+        if not exportCancelled then
+            append exportResults #(mesh.name, (collisionList.count > 0))
+        
+        -- Optional: print progress to listener
+        format "Exported: % (with % collision(s)) -> %\n" mesh.name collisionList.count fullPath
+    )
+    
+    -- If export was cancelled, show message
+    if exportCancelled then
+        messageBox "Export cancelled by user." title:"Export Cancelled"
+    
+    -- Restore original selection
+    select oldSelection
+    
+    -- Show summary dialog (only if any exports succeeded)
+    if exportResults.count > 0 then
+    (
+        rollout summaryRollout "Export Summary"
+        (
+            ListBox lbxResults "Results:" height:20 width:400
+            button btnOK "OK"
+            
+            on summaryRollout open do
+            (
+                local items = for res in exportResults collect \
+                    (res[1] + (if res[2] then " [Collision]" else " [No Collision]"))
+                lbxResults.items = items
+            )
+            on btnOK pressed do destroyDialog summaryRollout
+        )
+        createDialog summaryRollout width:450 height:400
+    )
+    
+    true
+)
+
+--------------------------------------------------------------------------------
+-- Main script execution
+-- Retrieve last used folder from settings
+lastPath = getINISetting settingsFile "Settings" "LastOutputPath"
+if lastPath == "" or not doesFileExist lastPath then
+    initialDir = getDir #export
+else
+    initialDir = lastPath
+
+-- Ask user for output folder
+outputDir = getSavePath caption:"Select Output Folder for FBX files" initialDir:initialDir
+if outputDir != undefined do
+(
+    -- Save the selected folder as last used
+    setINISetting settingsFile "Settings" "LastOutputPath" outputDir
+    
+    -- Call export function
+    exportMeshesWithCollisions outputDir
+)
+
+--------------------------------------------------------------------------------
+-- End of script
+
