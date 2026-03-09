@@ -1,0 +1,70 @@
+-- One-click import all FBX files in a folder
+(
+    -- Use .NET to select a folder
+    fn selectFolder =
+    (
+        local folderDialog = dotNetObject "System.Windows.Forms.FolderBrowserDialog"
+        folderDialog.Description = "Select folder containing FBX files"
+        folderDialog.ShowNewFolderButton = false
+        local result = folderDialog.ShowDialog()
+        if result == (dotNetClass "System.Windows.Forms.DialogResult").OK then
+            return folderDialog.SelectedPath
+        else
+            return undefined
+    )
+
+    -- Get folder path
+    local folderPath = selectFolder()
+    if folderPath == undefined do return false
+
+    -- Get all FBX files (case-insensitive)
+    local fbxFiles = getFiles (folderPath + "\\*.fbx")
+    if fbxFiles.count == 0 do
+    (
+        messageBox "No FBX files found in the folder." title:"Info"
+        return false
+    )
+
+    -- Set FBX import options (adjust as needed)
+    FbxImporterSetParam "Mode" #merge      -- merge into current scene
+    FbxImporterSetParam "Animation" true
+    FbxImporterSetParam "Cameras" true
+    FbxImporterSetParam "Lights" true
+    FbxImporterSetParam "Shapes" true
+    FbxImporterSetParam "Units" #scene      -- use scene units
+
+    -- Start import
+    local importedCount = 0
+    local failedFiles = #()
+
+    progressStart "Importing FBX files..."
+    for i = 1 to fbxFiles.count do
+    (
+        local file = fbxFiles[i]
+        progressUpdate (100.0 * i / fbxFiles.count)
+
+        try
+        (
+            importFile file #noPrompt
+            importedCount += 1
+        )
+        catch
+        (
+            append failedFiles (filenameFromPath file)
+            format "Import failed: %\n" file
+        )
+    )
+    progressEnd()
+
+    -- Display result
+    local msg = stringstream ""
+    format "Import completed. % files successfully imported." importedCount to:msg
+    if failedFiles.count > 0 then
+    (
+        format "\nThe following files failed to import:\n" to:msg
+        for f in failedFiles do format "%\n" f to:msg
+    )
+    messageBox (msg as string) title:"Import Result"
+
+    OK
+)
